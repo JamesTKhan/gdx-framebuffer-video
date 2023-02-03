@@ -1,6 +1,7 @@
 package com.jamestkhan.game.screens;
 
 import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.Input;
 import com.badlogic.gdx.InputMultiplexer;
 import com.badlogic.gdx.ScreenAdapter;
 import com.badlogic.gdx.graphics.Color;
@@ -23,8 +24,10 @@ import com.badlogic.gdx.graphics.g3d.utils.DefaultShaderProvider;
 import com.badlogic.gdx.graphics.g3d.utils.FirstPersonCameraController;
 import com.badlogic.gdx.graphics.glutils.FrameBuffer;
 import com.badlogic.gdx.graphics.glutils.GLFrameBuffer;
+import com.badlogic.gdx.graphics.glutils.ShaderProgram;
 import com.badlogic.gdx.math.Vector3;
 import com.badlogic.gdx.utils.Array;
+import com.badlogic.gdx.utils.GdxRuntimeException;
 import com.badlogic.gdx.utils.ScreenUtils;
 
 import java.awt.*;
@@ -33,8 +36,7 @@ import java.awt.*;
  * @author JamesTKhan
  * @version January 31, 2023
  */
-public class BaseScreen extends ScreenAdapter
-{
+public class BaseScreen extends ScreenAdapter {
     public PerspectiveCamera cam;
     public FirstPersonCameraController inputController;
     public ModelBatch modelBatch;
@@ -44,6 +46,17 @@ public class BaseScreen extends ScreenAdapter
     private final SpriteBatch spriteBatch;
 
     private FrameBuffer fbo;
+    private FrameBuffer blurTargetA;
+    private FrameBuffer blurTargetB;
+
+    private ShaderProgram blurShader;
+    private ShaderProgram defaultShader;
+
+    private int pingPongCount = 4;
+    private Texture guiTexture;
+    private float MAX_BLUR = 4;
+    private float deltaBlur = 0f;
+    private boolean paused = false;
 
     public BaseScreen() {
         DefaultShader.Config config = new DefaultShader.Config();
@@ -51,6 +64,9 @@ public class BaseScreen extends ScreenAdapter
 
         modelBatch = new ModelBatch(new DefaultShaderProvider(config));
         spriteBatch = new SpriteBatch();
+        defaultShader = spriteBatch.getShader();
+
+        blurShader = buildShader("shaders/blur.vert", "shaders/blur.frag");
 
         instances = new Array<>();
 
@@ -71,10 +87,26 @@ public class BaseScreen extends ScreenAdapter
 
         // Load Forest obj model
         loadModel();
+
+        guiTexture = new Texture(Gdx.files.internal("gui.png"));
+    }
+
+    private ShaderProgram buildShader(String vertexPath, String fragmentPath) {
+        String vert = Gdx.files.internal(vertexPath).readString();
+        String frag = Gdx.files.internal(fragmentPath).readString();
+        ShaderProgram program = new ShaderProgram(vert, frag);
+        if (!program.isCompiled()) {
+            throw new GdxRuntimeException(program.getLog());
+        }
+        return program;
     }
 
     private void buildFBO(int width, int height) {
+        if (width == 0 || height == 0) return;
+
         if (fbo != null) fbo.dispose();
+        if (blurTargetA != null) blurTargetA.dispose();
+        if (blurTargetB != null) blurTargetB.dispose();
 
         GLFrameBuffer.FrameBufferBuilder frameBufferBuilder = new GLFrameBuffer.FrameBufferBuilder(width, height);
         frameBufferBuilder.addBasicColorTextureAttachment(Pixmap.Format.RGBA8888);
@@ -82,11 +114,15 @@ public class BaseScreen extends ScreenAdapter
         // Enhanced precision, only needed for 3D scenes
         frameBufferBuilder.addDepthRenderBuffer(GL30.GL_DEPTH_COMPONENT24);
         fbo = frameBufferBuilder.build();
+
+        float blurScale = 1f;
+        blurTargetA = new FrameBuffer(Pixmap.Format.RGBA8888, (int) (width * blurScale), (int) (height * blurScale), false);
+        blurTargetB = new FrameBuffer(Pixmap.Format.RGBA8888, (int) (width * blurScale), (int) (height * blurScale), false);
     }
 
     @Override
     public void resize(int width, int height) {
-        spriteBatch.getProjectionMatrix().setToOrtho2D(0,0, width, height);
+        spriteBatch.getProjectionMatrix().setToOrtho2D(0, 0, width, height);
         buildFBO(width, height);
     }
 
@@ -94,21 +130,74 @@ public class BaseScreen extends ScreenAdapter
     public void render(float delta) {
         inputController.update();
 
-        fbo.begin();
+        if (Gdx.input.isKeyJustPressed(Input.Keys.ESCAPE)) {
+            deltaBlur = 0f;
+            paused = !paused;
+        }
+
+        if (paused) {
+            fbo.begin();
+            renderScene();
+            fbo.end();
+
+            // Get the color texture from the fbo
+            Texture fboTex = fbo.getColorBufferTexture();
+
+            Texture blurredResult = blurTexture(fboTex);
+
+            spriteBatch.begin();
+            spriteBatch.draw(blurredResult, 0, 0, Gdx.graphics.getWidth(), Gdx.graphics.getHeight(), 0, 0, 1, 1);
+            spriteBatch.draw(guiTexture, Gdx.graphics.getWidth() / 2f - guiTexture.getWidth() / 2f, Gdx.graphics.getHeight() / 2f - guiTexture.getHeight() / 2f);
+            spriteBatch.end();
+        } else {
+            renderScene();
+        }
+    }
+
+    private Texture blurTexture(Texture fboTex) {
+        //determine radius of blur based on mouse position
+        //float mouseXAmt = Gdx.input.getX() / (float)Gdx.graphics.getWidth();
+        //float mouseYAmt = (Gdx.graphics.getHeight()-Gdx.input.getY()-1) / (float)Gdx.graphics.getHeight();
+
+        if (deltaBlur < 1f) {
+            deltaBlur += Gdx.graphics.getDeltaTime() * 0.25f;
+        }
+
+        spriteBatch.setShader(blurShader);
+
+        for (int i = 0; i < pingPongCount; i++) {
+            // Horizontal blur pass
+            blurTargetA.begin();
+            spriteBatch.begin();
+            blurShader.setUniformf("dir", .5f, 0);
+            blurShader.setUniformf("radius", deltaBlur * MAX_BLUR);
+            blurShader.setUniformf("resolution", Gdx.graphics.getWidth());
+            spriteBatch.draw(i == 0 ? fboTex : blurTargetB.getColorBufferTexture(), 0, 0, Gdx.graphics.getWidth(), Gdx.graphics.getHeight(), 0, 0, 1, 1);
+            spriteBatch.end();
+            blurTargetA.end();
+
+            // Verticle blur pass
+            blurTargetB.begin();
+            spriteBatch.begin();
+            blurShader.setUniformf("dir", 0, .5f);
+            blurShader.setUniformf("radius", deltaBlur * MAX_BLUR);
+            blurShader.setUniformf("resolution", Gdx.graphics.getHeight());
+            spriteBatch.draw(blurTargetA.getColorBufferTexture(), 0, 0, Gdx.graphics.getWidth(), Gdx.graphics.getHeight(), 0, 0, 1, 1);
+            spriteBatch.end();
+            blurTargetB.end();
+        }
+
+        spriteBatch.setShader(defaultShader);
+
+        return blurTargetB.getColorBufferTexture();
+    }
+
+    private void renderScene() {
         ScreenUtils.clear(Color.SKY, true);
         modelBatch.begin(cam);
         modelBatch.render(instances, environment);
         modelBatch.end();
-        fbo.end();
-
-        // Get the color texture from the fbo
-        Texture fboTex = fbo.getColorBufferTexture();
-
-        spriteBatch.begin();
-        spriteBatch.draw(fboTex, 0,0, Gdx.graphics.getWidth(), Gdx.graphics.getHeight(), 0,0,1,1);
-        spriteBatch.end();
     }
-
 
     @Override
     public void dispose() {
